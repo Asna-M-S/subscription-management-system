@@ -1,0 +1,24 @@
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Python / Odoo local development
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+.venv/
+venv/
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
