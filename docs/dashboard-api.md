@@ -12,6 +12,21 @@ If `APP_API_TOKEN` is set in `.env`, send it to this bridge as `Authorization: B
 
 All business endpoints use the Odoo user's permissions. Dates use `YYYY-MM-DD`, the default display currency is `INR`, and list endpoints use `{ "items": [], "pagination": { "page": 1, "limit": 20, "total": 0 } }`.
 
+## Browser dashboard proxy
+
+The dashboard must not contain `APP_API_TOKEN` in React code or a `VITE_*` variable. The backend exposes these read-only browser routes and adds the app token while forwarding each request to the matching `/api/v1/*` route:
+
+| Browser route | Forwarded API route |
+|---|---|
+| `GET /dashboard-api/summary` | `/api/v1/dashboard/summary` |
+| `GET /dashboard-api/subscriptions?page=1&limit=20&status=ACTIVE` | `/api/v1/subscriptions` |
+| `GET /dashboard-api/invoices/overdue?page=1&limit=20` | `/api/v1/invoices?status=OVERDUE` |
+| `GET /dashboard-api/payments?page=1&limit=20&from=2026-10-01&to=2026-10-31` | `/api/v1/payments` |
+
+The proxy only accepts these GET routes. Subscription query parameters are `page`, `limit`, and `status`; payment parameters are `page`, `limit`, `from`, and `to`; the overdue route fixes `status=OVERDUE`. The existing list pagination and JSON response shapes are preserved. The frontend calls the browser routes on the backend origin; it does not send an authorization header.
+
+**Access note:** these proxy routes do not ask the browser for a bearer token, so anyone who can reach the backend can read the dashboard data. The temporary Cloudflare tunnel is internet-accessible. Use this only with hackathon demo records; add the frontend's login/session check before using real customer data or sharing a public deployment. The proxy is read-only and does not expose create, payment, invoice-posting, or subscription-action routes.
+
 ## Routes
 
 | Method | Route | Odoo operation |
@@ -52,6 +67,102 @@ List routes accept `page` and `limit` query parameters. Subscriptions and invoic
 ```
 
 Values above illustrate the response shape only; live totals come from Odoo. `monthlyRecurringRevenue` sums Odoo's monthly-equivalent recurring value for active subscriptions before tax. It excludes paused and closed subscriptions. Outstanding and overdue amounts use the residual balance on posted customer invoices. Collected revenue counts inbound payments Odoo marks paid or in process during the current month.
+
+## Exact dashboard response shapes
+
+The proxy returns the same JSON as the underlying API. Numeric amounts are JSON numbers; dates and nullable dates use `YYYY-MM-DD` or `null`.
+
+`GET /dashboard-api/summary` returns one object:
+
+```json
+{
+  "currency": "INR",
+  "activeSubscriptions": 1,
+  "monthlyRecurringRevenue": 9000.0,
+  "revenueCollectedThisMonth": 0.0,
+  "outstandingAmount": 0.0,
+  "overdueAmount": 0.0,
+  "overdueInvoicesCount": 0
+}
+```
+
+`GET /dashboard-api/subscriptions?status=ACTIVE` returns a paginated object:
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "number": "S00001",
+      "customerName": "Example Customer",
+      "productName": "Subscription Service",
+      "variantName": null,
+      "planName": "Monthly",
+      "status": "ACTIVE",
+      "billingInterval": "1 month",
+      "startDate": "2026-10-31",
+      "nextBillingDate": "2026-11-30",
+      "endDate": null,
+      "quantity": 1.0,
+      "unitPrice": 9000.0,
+      "discountPercent": 0.0,
+      "recurringAmount": 9000.0,
+      "monthlyRecurringRevenue": 9000.0,
+      "currency": "INR",
+      "autoRenew": true
+    }
+  ],
+  "pagination": { "page": 1, "limit": 20, "total": 1 }
+}
+```
+
+`GET /dashboard-api/invoices/overdue` returns posted overdue invoices using the same pagination wrapper:
+
+```json
+{
+  "items": [
+    {
+      "id": 2,
+      "number": "INV/2026/0002",
+      "customerName": "Example Customer",
+      "subscriptionId": "S00001",
+      "issueDate": "2026-10-01",
+      "dueDate": "2026-10-15",
+      "status": "OVERDUE",
+      "subtotal": 9000.0,
+      "discountAmount": 0.0,
+      "taxAmount": 1620.0,
+      "total": 10620.0,
+      "amountPaid": 0.0,
+      "balanceDue": 10620.0,
+      "currency": "INR"
+    }
+  ],
+  "pagination": { "page": 1, "limit": 20, "total": 1 }
+}
+```
+
+`GET /dashboard-api/payments` returns a paginated object:
+
+```json
+{
+  "items": [
+    {
+      "id": 3,
+      "invoiceId": 2,
+      "invoiceNumber": "INV/2026/0002",
+      "customerName": "Example Customer",
+      "amount": 10620.0,
+      "method": "Bank",
+      "paidAt": "2026-10-31",
+      "note": "Invoice payment",
+      "currency": "INR",
+      "status": "paid"
+    }
+  ],
+  "pagination": { "page": 1, "limit": 20, "total": 1 }
+}
+```
 
 ## Subscription response fields
 

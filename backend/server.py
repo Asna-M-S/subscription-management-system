@@ -8,7 +8,9 @@ import os
 import re
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, unquote, urlparse
+from urllib.request import Request, urlopen
 
 from odoo_client import OdooAPIError, OdooJSON2Client, load_env_file
 
@@ -538,6 +540,50 @@ def register_payment(body):
     return {"invoiceNumber": number, "amount": round(amount, 2), "result": result, "message": "Odoo payment registration completed."}
 
 
+def dashboard_proxy_target(path, query):
+    """Map browser dashboard paths to a small, read-only set of API routes."""
+    if path == "/dashboard-api/summary":
+        return "/api/v1/dashboard/summary", {}
+    if path == "/dashboard-api/subscriptions":
+        allowed = {"page", "limit", "status"}
+        return "/api/v1/subscriptions", {key: value for key, value in query.items() if key in allowed}
+    if path == "/dashboard-api/invoices/overdue":
+        allowed = {"page", "limit"}
+        params = {key: value for key, value in query.items() if key in allowed}
+        params["status"] = ["OVERDUE"]
+        return "/api/v1/invoices", params
+    if path == "/dashboard-api/payments":
+        allowed = {"page", "limit", "from", "to"}
+        return "/api/v1/payments", {key: value for key, value in query.items() if key in allowed}
+    return None, None
+
+
+def forward_dashboard_get(path, query):
+    """Forward an allowlisted dashboard GET through the existing authenticated API."""
+    if not APP_API_TOKEN:
+        raise OdooAPIError(503, "Dashboard proxy is unavailable until APP_API_TOKEN is configured.")
+    target, params = dashboard_proxy_target(path, query)
+    if not target:
+        raise OdooAPIError(404, "Dashboard proxy route not found.")
+    query_string = urlencode(params, doseq=True)
+    url = f"http://127.0.0.1:{PORT}{target}"
+    if query_string:
+        url = f"{url}?{query_string}"
+    request = Request(url, headers={"Authorization": f"Bearer {APP_API_TOKEN}", "Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {"error": "Dashboard API request failed."}
+        return error.code, payload
+    except (URLError, TimeoutError, OSError) as error:
+        detail = error.reason if isinstance(error, URLError) else error
+        raise OdooAPIError(502, f"Could not reach the dashboard API: {detail}") from None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "BrightloopOdooBridge/1.0"
 
@@ -573,6 +619,12 @@ class Handler(BaseHTTPRequestHandler):
         path, query = unquote(parsed.path.rstrip("/")) or "/", parse_qs(parsed.query)
         if path == "/health":
             return self.send_json(200, {"status": "ok", "odooConfigured": ODOO.configured, "source": "odoo"})
+        if path.startswith("/dashboard-api/"):
+            try:
+                status, payload = forward_dashboard_get(path, query)
+                return self.send_json(status, payload)
+            except OdooAPIError as error:
+                return self.send_json(error.status, {"error": error.message})
         if not self.authorized():
             return self.send_json(401, {"error": "A valid app bearer token is required."})
         try:
