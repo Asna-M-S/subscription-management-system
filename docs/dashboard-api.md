@@ -80,7 +80,7 @@ This creates a real Odoo subscription sale order and confirms it. IDs are Odoo r
 
 ## Invoice and payment response fields
 
-Invoice fields: `id`, `number`, `customerName`, `subscriptionId` (Odoo invoice origin), `issueDate`, `dueDate`, `status`, `subtotal`, `discountAmount`, `taxAmount`, `total`, `amountPaid`, `balanceDue`, and `currency`.
+Invoice fields: `id`, `number`, `customerName`, `subscriptionId` (Odoo invoice origin), `issueDate`, `dueDate`, `status`, `subtotal`, `discountAmount`, `taxAmount`, `total`, `amountPaid`, `balanceDue`, and `currency`. If Odoo has not assigned a stored number to a draft yet, the API returns `DRAFT-{id}` as its temporary reference; posting assigns the Odoo invoice number. A draft API reference such as `DRAFT-1` can be used with the invoice post route.
 
 Payment fields: `id`, `invoiceId`, `invoiceNumber`, `customerName`, `amount`, `method`, `paidAt`, `note`, `currency`, and `status`.
 
@@ -107,4 +107,4 @@ The automation teammate can call `/api/v1/billing/due` to see which real subscri
 
 ## Current Odoo record references
 
-The Odoo database previously showed subscription `S00001` and draft invoice `INV/26-27/0001`. The draft invoice total was reviewed as ₹10,620 (₹9,000 subtotal plus ₹1,620 tax), with no payment recorded then. Verify the current live record state in Odoo before using it in a presentation.
+The current Odoo database read returned subscription `S00001` as active with ₹9,000 MRR, and draft invoice record ID `1` linked to it: ₹9,000 subtotal + ₹1,620 GST = ₹10,620 total and amount due, with no payment recorded. In the Odoo form the draft displays `INV/26-27/0001`; its stored API `name` is still empty, so the bridge exposes it as `DRAFT-1` until Odoo assigns the posted invoice number. The dashboard's outstanding receivable total counts posted invoices only, so this draft is not counted as an outstanding receivable yet.

@@ -211,6 +211,50 @@ def invoice_status(row):
     return "CONFIRMED"
 
 
+def load_taxes(tax_ids):
+    taxes, pending = {}, set(tax_ids)
+    tax_fields = fields("account.tax", ["id", "amount", "amount_type", "children_tax_ids", "sequence", "include_base_amount"])
+    while pending:
+        batch = sorted(pending - set(taxes))
+        if not batch:
+            break
+        rows = ODOO.call("account.tax", "read", ids=batch, fields=tax_fields)
+        for row in rows:
+            taxes[row["id"]] = row
+            pending.update(rel_ids(row.get("children_tax_ids")))
+    return taxes
+
+
+def tax_amount(tax_id, base, quantity, tax_records, depth=0):
+    if depth > 8:
+        return 0.0
+    tax = tax_records.get(tax_id, {})
+    kind = tax.get("amount_type")
+    rate = float(tax.get("amount") or 0)
+    children = rel_ids(tax.get("children_tax_ids"))
+    if kind == "group" or children:
+        total, running_base, added_for_next_sequence, previous_sequence = 0.0, base, 0.0, None
+        child_records = sorted((tax_records.get(child_id, {}) for child_id in children), key=lambda child: child.get("sequence", 0))
+        for child in child_records:
+            sequence = child.get("sequence", 0)
+            if previous_sequence is not None and sequence > previous_sequence:
+                running_base += added_for_next_sequence
+                added_for_next_sequence = 0.0
+            amount = tax_amount(child.get("id"), running_base, quantity, tax_records, depth + 1)
+            total += amount
+            if child.get("include_base_amount"):
+                added_for_next_sequence += amount
+            previous_sequence = sequence
+        return total
+    if kind == "percent":
+        return base * rate / 100
+    if kind == "division" and rate != 100:
+        return base * rate / (100 - rate)
+    if kind == "fixed":
+        return rate * quantity
+    return 0.0
+
+
 def invoices(query):
     model = "account.move"
     domain = [["move_type", "=", "out_invoice"]]
@@ -230,21 +274,40 @@ def invoices(query):
     rows = search_read(model, domain, ["id", "name", "partner_id", "invoice_origin", "invoice_date", "invoice_date_due", "state", "payment_state", "amount_untaxed", "amount_tax", "amount_total", "amount_residual", "invoice_line_ids"], limit, offset, "id desc")
     line_ids = sorted({line_id for row in rows for line_id in rel_ids(row.get("invoice_line_ids"))})
     discounts = {}
+    line_data_by_invoice = {}
     if line_ids:
-        lines = ODOO.call("account.move.line", "read", ids=line_ids, fields=fields("account.move.line", ["id", "move_id", "quantity", "price_unit", "discount", "display_type"]))
+        lines = ODOO.call("account.move.line", "read", ids=line_ids, fields=fields("account.move.line", ["id", "move_id", "quantity", "price_unit", "price_subtotal", "discount", "tax_ids", "display_type"]))
+        all_tax_ids = sorted({tax_id for line in lines for tax_id in rel_ids(line.get("tax_ids"))})
+        tax_records = load_taxes(all_tax_ids) if all_tax_ids else {}
         for line in lines:
             if line.get("display_type") in {"line_section", "line_note"}:
                 continue
             move_id = rel_id(line.get("move_id"))
-            discounts[move_id] = discounts.get(move_id, 0) + float(line.get("quantity") or 0) * float(line.get("price_unit") or 0) * float(line.get("discount") or 0) / 100
+            quantity = float(line.get("quantity") or 0)
+            unit_price = float(line.get("price_unit") or 0)
+            discount = float(line.get("discount") or 0)
+            original = unit_price * quantity
+            subtotal = line.get("price_subtotal")
+            base = float(subtotal) if subtotal is not None else original * (1 - discount / 100)
+            discounts[move_id] = discounts.get(move_id, 0) + original * discount / 100
+            line_tax = sum(tax_amount(tax_id, base, quantity, tax_records) for tax_id in rel_ids(line.get("tax_ids")))
+            line_data_by_invoice.setdefault(move_id, []).append({"subtotal": base, "tax": line_tax})
     items = []
     for row in rows:
-        total_amount, due = float(row.get("amount_total") or 0), float(row.get("amount_residual") or 0)
+        computed_lines = line_data_by_invoice.get(row["id"], [])
+        computed_subtotal = sum(line["subtotal"] for line in computed_lines)
+        computed_tax = sum(line["tax"] for line in computed_lines)
+        stored_tax = float(row.get("amount_tax") or 0)
+        use_line_tax_calc = row.get("state") == "draft" and bool(computed_lines)
+        untaxed = float(row.get("amount_untaxed") or computed_subtotal)
+        tax_total = computed_tax if use_line_tax_calc else stored_tax
+        total_amount = untaxed + tax_total if use_line_tax_calc else float(row.get("amount_total") or 0)
+        due = total_amount if row.get("state") == "draft" else float(row.get("amount_residual") or 0)
         items.append({
-            "id": row.get("id"), "number": row.get("name"), "customerName": rel_name(row.get("partner_id")),
+            "id": row.get("id"), "number": row.get("name") or f"DRAFT-{row.get('id')}", "customerName": rel_name(row.get("partner_id")),
             "subscriptionId": row.get("invoice_origin") or "", "issueDate": row.get("invoice_date"), "dueDate": row.get("invoice_date_due"),
-            "status": invoice_status(row), "subtotal": round(float(row.get("amount_untaxed") or 0), 2),
-            "discountAmount": round(discounts.get(row["id"], 0), 2), "taxAmount": round(float(row.get("amount_tax") or 0), 2),
+            "status": invoice_status(row), "subtotal": round(untaxed, 2),
+            "discountAmount": round(discounts.get(row["id"], 0), 2), "taxAmount": round(tax_total, 2),
             "total": round(total_amount, 2), "amountPaid": round(max(total_amount - due, 0), 2),
             "balanceDue": round(due, 2), "currency": CURRENCY,
         })
@@ -427,7 +490,14 @@ def subscription_action(number, action, body):
 
 
 def post_invoice(number):
-    row = find_name("account.move", number, ["id", "state"], [["move_type", "=", "out_invoice"]])
+    draft_id = re.fullmatch(r"DRAFT-(\d+)", number)
+    if draft_id:
+        rows = search_read("account.move", [["move_type", "=", "out_invoice"], ["id", "=", int(draft_id.group(1))]], ["id", "state"], limit=1)
+        if not rows:
+            raise OdooAPIError(404, f"No draft invoice was found with API reference {number}.")
+        row = rows[0]
+    else:
+        row = find_name("account.move", number, ["id", "state"], [["move_type", "=", "out_invoice"]])
     if row.get("state") != "draft":
         raise OdooAPIError(409, "Only a draft invoice can be posted.")
     ODOO.call("account.move", "action_post", ids=[row["id"]])
