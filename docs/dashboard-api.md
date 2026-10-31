@@ -2,6 +2,21 @@
 
 **Status:** Proposed contract for the dashboard mock data. Endpoints are not live until the backend/Odoo integration is connected.
 
+## Odoo demo records
+
+Use these records as reference data while building the dashboard with mock data. They are stored in the Odoo database and are not returned by the API yet.
+
+| Record | Details |
+|---|---|
+| Customer | Sunmart Hackathon Demo |
+| Subscription | `S00001` — Brightloop Monthly, In Progress, 10 units, 10% discount |
+| Subscription value | ₹9,000 monthly recurring revenue before tax |
+| Invoice | `INV/26-27/0001` — draft, linked to `S00001` |
+| Invoice totals | ₹9,000 subtotal + ₹1,620 GST = ₹10,620 total |
+| Invoice balance display | Draft currently displays ₹9,000 as Amount Due; verify/recompute before posting |
+
+These are demo records. Do not treat them as live API responses or payment data.
+
 ## Conventions
 
 - Prefix: `/api/v1`
