@@ -13,9 +13,9 @@ Use these records as reference data while building the dashboard with mock data.
 | Subscription value | ₹9,000 monthly recurring revenue before tax |
 | Invoice | `INV/26-27/0001` — draft, linked to `S00001` |
 | Invoice totals | ₹9,000 subtotal + ₹1,620 GST = ₹10,620 total |
-| Invoice balance display | Draft currently displays ₹9,000 as Amount Due; verify/recompute before posting |
+| Invoice balance display | ₹10,620 Amount Due after refreshing the GST tax selection |
 
-These are demo records. Do not treat them as live API responses or payment data.
+These are demo records. The invoice remains a draft and no payment has been recorded. Do not treat them as live API responses or payment data.
 
 ## Conventions
 
