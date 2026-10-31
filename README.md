@@ -1,37 +1,35 @@
-# Subscription Management System
+# Brightloop Subscription Management System
 
-A hackathon project for managing Brightloop Software's subscription lifecycle: products and plans, quotations, subscriptions, recurring invoices, discounts, payments, and revenue reporting.
+Hackathon backend for Brightloop Software's subscription lifecycle. The hosted Odoo database is the source of truth for customers, products, subscription plans, subscriptions, invoices, and payments. The Python server in this repository is a small REST bridge to Odoo; it does not seed or store a second set of business records.
 
-## Project status
+## Odoo connection requirement
 
-The Odoo workspace is being configured with the Sales, Subscriptions, and Invoicing apps. This repository is the team's shared project space for implementation notes and integration contracts. Odoo customer and accounting records remain in the Odoo database and are not stored in GitHub.
+The team's database is Odoo 20 Enterprise. Odoo's external JSON-2 API requires a **Custom** subscription plan. Standard and One App Free plans do not include external API access. If this database is on a trial or another plan, check the Odoo subscription page before expecting the REST bridge to connect.
 
-## Team responsibilities
+Create an API key while signed in to the Odoo user that should access the records: open your avatar menu → **My Profile / Preferences** → **Account Security** → **New API Key**. Give it a short expiry, copy it once, and save it only in the local `.env` file. The key is shown only once. Do not put it in GitHub, frontend code, or a chat message. The API user needs read access to customers, products, subscriptions, invoices, and payments; write access is needed for create and lifecycle routes.
 
-- **Odoo business logic:** products, variants, subscription plans, quotations, subscription states, invoices, taxes, discounts, and payments.
-- **Customer interface:** account access and subscription/invoice screens.
-- **Automation:** scheduled billing triggers, reminders, renewal notices, and payment updates.
-- **Dashboard and integration:** subscription, revenue, payment, and overdue-invoice summaries.
+## Start the Odoo-backed API
 
-## Core demonstration flow
+1. Copy `.env.example` to `.env` in the repository root.
+2. Keep the Odoo URL and database name shown in `.env.example` and enter the API key locally as `ODOO_API_KEY=...`.
+3. From the repository root, run:
 
-1. Create a product and a monthly subscription plan.
-2. Create a customer quotation and confirm it as a subscription.
-3. Generate the invoice for the due billing period.
-4. Record a payment against the invoice.
-5. Show the updated subscription, invoice, and payment in the customer interface and financial dashboard.
+   ```bash
+   python3 backend/server.py
+   ```
 
-## Sample data for the demo
+4. Open `http://127.0.0.1:8000/health` for local server status, then `http://127.0.0.1:8000/api/v1/health/odoo` to verify an authenticated read from Odoo.
 
-- Product: `Brightloop Inventory`
-- Base price: INR 1,000 per seat per month
-- Variant: `Odoo`, adding INR 560 per seat
-- Customer: `Sunmart`
-- Quantity: 10 seats
-- Example discount: 10% for 10 or more seats
+The server uses only Python's standard library. If a teammate's browser app calls it, keep the Odoo key on this backend. Share an `APP_API_TOKEN` with the teammate through a private channel if you set one. Do not place the Odoo key in browser JavaScript. For a server on another computer, deploy it over HTTPS and set a strong `APP_API_TOKEN`; do not expose the local server publicly without authentication.
 
-Use only test data during the hackathon. Tax rates should follow the value selected for the demo; the problem statement does not prescribe a rate.
+## API contract
 
-## Integration
+Routes and JSON response shapes are in [`docs/dashboard-api.md`](docs/dashboard-api.md). The REST bridge reads live Odoo records and performs supported actions through Odoo's JSON-2 model API. Recurring invoice creation remains Odoo's own subscription billing process; the bridge shows invoices created there. Payment registration uses Odoo's accounting payment wizard and creates a real Odoo payment record.
 
-The proposed dashboard response fields are documented in [`docs/dashboard-api.md`](docs/dashboard-api.md). The team should confirm the available Odoo integration method for its database before treating the proposed endpoints as live. Do not commit passwords, API keys, or `.env` files.
+## Demo reference records
+
+The hosted database previously contained subscription `S00001` and draft invoice `INV/26-27/0001` for review. The invoice was described as ₹10,620 total (₹9,000 subtotal + ₹1,620 GST), with no payment recorded. These are Odoo records, not seeded API fixtures. Confirm their current state in Odoo before presenting them.
+
+## Local-only demo
+
+`backend/local_demo_server.py` is the earlier SQLite sample server. It is retained only for reference and is not the backend to use for the actual Odoo-connected application.
