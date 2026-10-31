@@ -4,7 +4,9 @@ A hackathon project for managing Brightloop Software's subscription lifecycle: p
 
 ## Project status
 
-The Odoo workspace is being configured with the Sales, Subscriptions, and Invoicing apps. This repository is the team's shared project space for implementation notes and integration contracts. Odoo customer and accounting records remain in the Odoo database and are not stored in GitHub.
+The Odoo workspace has a demo product, monthly plan, active subscription, quotation template, and draft invoice. This repository now also contains a small local REST API backed by SQLite so the frontend and dashboard teammates can work against real endpoints.
+
+The local API database is separate from the hosted Odoo database. Odoo records do not sync to it yet; the API starts with its own clearly named demo records.
 
 ## Team responsibilities
 
@@ -34,4 +36,16 @@ Use only test data during the hackathon. Tax rates should follow the value selec
 
 ## Integration
 
-The proposed dashboard response fields are documented in [`docs/dashboard-api.md`](docs/dashboard-api.md). The team should confirm the available Odoo integration method for its database before treating the proposed endpoints as live. Do not commit passwords, API keys, or `.env` files.
+The API fields and routes are documented in [`docs/dashboard-api.md`](docs/dashboard-api.md). The Odoo connection is still pending. Do not commit passwords, API keys, or `.env` files.
+
+## Run the local API
+
+Requires Python 3.10 or newer; no packages need to be installed.
+
+```bash
+python3 backend/server.py
+```
+
+The server starts at `http://127.0.0.1:8000`. Visit `/health` to see its status. SQLite data is saved to `data/subscriptions.sqlite3` and is ignored by Git. To reset the local demo database, stop the server, remove that file, and start the server again; it will recreate the seed records.
+
+The API currently supports customers, products and variants, recurring plans, subscriptions and lifecycle actions, invoice generation/confirmation, partial and full payment recording, and dashboard summaries. Authentication, production deployment, and live Odoo synchronization still need to be added before real customer or financial data is used.
