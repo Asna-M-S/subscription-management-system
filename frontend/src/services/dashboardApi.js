@@ -1,72 +1,70 @@
-import axios from 'axios'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL
 
-const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
-
-function assertDashboardPayload(payload) {
-  const requiredSummaryValues = [
-    'activeSubscriptions',
-    'monthlyRecurringRevenue',
-    'revenueCollectedThisMonth',
-    'outstandingAmount',
-    'pendingAmount',
-    'overdueAmount',
-    'overdueInvoicesCount',
-  ]
-
-  if (!isRecord(payload) || !isRecord(payload.summary)) {
-    throw new Error('Dashboard API response must include a summary object.')
-  }
-  if (requiredSummaryValues.some((key) => !Number.isFinite(payload.summary[key]))) {
-    throw new Error('Dashboard API summary is missing one or more numeric financial fields.')
-  }
-  if (!Array.isArray(payload.transactions) || !Array.isArray(payload.overdueInvoices)) {
-    throw new Error('Dashboard API response must include transactions and overdueInvoices arrays.')
-  }
-  if (payload.transactions.some((item) =>
-    !isRecord(item) ||
-    !['name', 'id', 'date', 'method', 'status'].every((key) => typeof item[key] === 'string') ||
-    !Number.isFinite(item.amount),
-  )) {
-    throw new Error('Dashboard API transactions contain an invalid record.')
-  }
-  if (payload.overdueInvoices.some((item) =>
-    !isRecord(item) ||
-    !['id', 'customer', 'dueDate'].every((key) => typeof item[key] === 'string') ||
-    !Number.isFinite(item.amount) ||
-    !Number.isFinite(item.daysOverdue),
-  )) {
-    throw new Error('Dashboard API overdueInvoices contain an invalid record.')
-  }
-  if (!isRecord(payload.calendarPayments)) {
-    throw new Error('Dashboard API response must include a calendarPayments object keyed by YYYY-MM-DD.')
-  }
-  if (Object.entries(payload.calendarPayments).some(([date, items]) =>
-    !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
-    !Array.isArray(items) ||
-    items.some((item) =>
-      !isRecord(item) ||
-      !['customer', 'method', 'status'].every((key) => typeof item[key] === 'string') ||
-      !Number.isFinite(item.amount),
-    ),
-  )) {
-    throw new Error('Dashboard API calendarPayments must contain valid payment records keyed by YYYY-MM-DD.')
-  }
-  if (!isRecord(payload.revenueSeries) || ['Weekly', 'Monthly', 'Yearly'].some((period) =>
-    !Array.isArray(payload.revenueSeries[period]) ||
-    payload.revenueSeries[period].some((point) =>
-      !isRecord(point) || typeof point.label !== 'string' || !Number.isFinite(point.revenue),
-    ),
-  )) {
-    throw new Error('Dashboard API response must include valid Weekly, Monthly, and Yearly revenueSeries.')
-  }
-  if (!Number.isFinite(payload.collectionSuccessRate) || payload.collectionSuccessRate < 0 || payload.collectionSuccessRate > 100) {
-    throw new Error('Dashboard API response must include a collectionSuccessRate between 0 and 100.')
+async function getJson(path, signal) {
+  if (!API_BASE_URL) {
+    throw new Error('VITE_API_BASE_URL is missing from frontend/.env.local')
   }
 
-  return payload
+  const response = await fetch(`${API_BASE_URL}${path}`, { signal })
+
+  if (!response.ok) {
+    throw new Error(`Dashboard API request failed (${response.status})`)
+  }
+
+  return response.json()
 }
 
-export async function fetchDashboardOverview(endpoint, signal) {
-  const response = await axios.get(endpoint, { signal })
-  return assertDashboardPayload(response.data)
+const money = (value) => Number(value ?? 0)
+
+export async function fetchDashboardOverview(_endpoint, signal) {
+  const [summary, overdue, payments] = await Promise.all([
+    getJson('/dashboard-api/summary', signal),
+    getJson('/dashboard-api/invoices/overdue?page=1&limit=20', signal),
+    getJson('/dashboard-api/payments?page=1&limit=100', signal),
+  ])
+
+  const transactions = (payments.items ?? []).map((payment) => ({
+    id: String(payment.invoiceNumber ?? payment.invoiceId ?? payment.id),
+    name: payment.customerName ?? 'Customer',
+    date: payment.paidAt ?? '',
+    amount: money(payment.amount),
+    method: payment.method ?? '—',
+    status: payment.status ?? 'Paid',
+  }))
+
+  const overdueInvoices = (overdue.items ?? []).map((invoice) => ({
+    id: String(invoice.number ?? invoice.id),
+    customer: invoice.customerName ?? 'Customer',
+    dueDate: invoice.dueDate ?? '',
+    amount: money(invoice.balanceDue),
+    daysOverdue: invoice.dueDate
+      ? Math.max(0, Math.floor((Date.now() - new Date(invoice.dueDate).getTime()) / 86400000))
+      : 0,
+  }))
+
+  const calendarPayments = {}
+  for (const payment of payments.items ?? []) {
+    const date = payment.paidAt?.slice(0, 10)
+    if (!date) continue
+
+    calendarPayments[date] ??= []
+    calendarPayments[date].push({
+      customer: payment.customerName ?? 'Customer',
+      method: payment.method ?? '—',
+      status: payment.status ?? 'Paid',
+      amount: money(payment.amount),
+    })
+  }
+
+  return {
+    summary: {
+      ...summary,
+      pendingAmount: 0,
+    },
+    transactions,
+    overdueInvoices,
+    calendarPayments,
+    revenueSeries: { Weekly: [], Monthly: [], Yearly: [] },
+    collectionSuccessRate: 0,
+  }
 }

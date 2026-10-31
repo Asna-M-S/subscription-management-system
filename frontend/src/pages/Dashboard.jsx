@@ -18,7 +18,7 @@ import { fetchDashboardOverview } from '../services/dashboardApi'
 import { formatCurrency } from '../services/formatters'
 
 const RevenueChart = lazy(() => import('../components/RevenueChart'))
-const dashboardEndpoint = import.meta.env.VITE_DASHBOARD_API_URL
+const dashboardEndpoint = `${import.meta.env.VITE_API_BASE_URL}/dashboard-api/summary`
 
 const statusStyles = {
   Paid: 'bg-emerald-400/10 text-emerald-300 ring-emerald-400/20',
@@ -126,27 +126,35 @@ function TransactionsTable({ transactions: rows }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((item) => (
-              <tr key={item.id} className="border-b border-white/[0.045] transition hover:bg-white/[0.025] last:border-0">
-                <td className="px-6 py-4">
-                  <div className="flex items-center gap-3">
-                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-800 text-xs font-semibold text-slate-300">
-                      {item.name.split(' ').map((part) => part[0]).join('')}
+            {rows.length > 0 ? (
+              rows.map((item) => (
+                <tr key={item.id} className="border-b border-white/[0.045] transition hover:bg-white/[0.025] last:border-0">
+                  <td className="px-6 py-4">
+                    <div className="flex items-center gap-3">
+                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-800 text-xs font-semibold text-slate-300">
+                        {item.name.split(' ').map((part) => part[0]).join('')}
+                      </span>
+                      <span className="font-medium text-slate-200">{item.name}</span>
+                    </div>
+                  </td>
+                  <td className="px-4 py-4 font-mono text-xs text-slate-400">{item.id}</td>
+                  <td className="px-4 py-4 text-slate-400">{item.date}</td>
+                  <td className="px-4 py-4 font-medium text-white">{formatCurrency(item.amount)}</td>
+                  <td className="px-4 py-4 text-slate-400">{item.method}</td>
+                  <td className="px-6 py-4">
+                    <span className={`rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${statusStyles[item.status]}`}>
+                      {item.status}
                     </span>
-                    <span className="font-medium text-slate-200">{item.name}</span>
-                  </div>
-                </td>
-                <td className="px-4 py-4 font-mono text-xs text-slate-400">{item.id}</td>
-                <td className="px-4 py-4 text-slate-400">{item.date}</td>
-                <td className="px-4 py-4 font-medium text-white">{formatCurrency(item.amount)}</td>
-                <td className="px-4 py-4 text-slate-400">{item.method}</td>
-                <td className="px-6 py-4">
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${statusStyles[item.status]}`}>
-                    {item.status}
-                  </span>
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={6} className="px-6 py-8 text-center text-sm text-slate-500">
+                  No payments recorded yet.
                 </td>
               </tr>
-            ))}
+            )}
           </tbody>
         </table>
       </div>

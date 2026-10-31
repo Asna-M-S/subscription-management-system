@@ -123,7 +123,7 @@ export default function PaymentCalendar({ payments = calendarPayments }) {
           </div>
         ) : (
           <div className="rounded-xl border border-dashed border-white/[0.09] px-4 py-5 text-center text-xs text-slate-500">
-            No payments scheduled for this date.
+            No payments recorded yet.
           </div>
         )}
       </div>
