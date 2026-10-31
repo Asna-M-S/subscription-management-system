@@ -1,707 +1,597 @@
-"""Small, dependency-free REST API for the hackathon subscription demo.
-
-This local SQLite service implements the team's dashboard contract. Its demo
-database is separate from Brightloop's hosted Odoo database; it does not sync
-to Odoo until an Odoo connector is configured.
-"""
+"""REST bridge to the team's hosted Odoo 20 JSON-2 API; no local data store."""
 
 from __future__ import annotations
 
-import calendar
+import hmac
 import json
 import os
 import re
-import sqlite3
-from datetime import date, timedelta
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from odoo_client import OdooAPIError, OdooJSON2Client, load_env_file
 
-ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = Path(os.environ.get("SUBSCRIPTION_DB_PATH", ROOT / "data" / "subscriptions.sqlite3"))
+load_env_file()
+ODOO = OdooJSON2Client()
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8000"))
-CURRENCY = "INR"
+CURRENCY = os.environ.get("CURRENCY", "INR")
+APP_API_TOKEN = os.environ.get("APP_API_TOKEN", "").strip()
+MAX_LIMIT = 100
 
 
-SCHEMA = """
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS customers (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    product_type TEXT NOT NULL CHECK (product_type IN ('SERVICE', 'GOODS')),
-    sales_price REAL NOT NULL CHECK (sales_price >= 0),
-    cost_price REAL NOT NULL CHECK (cost_price >= 0),
-    notes TEXT NOT NULL DEFAULT '',
-    active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS product_variants (
-    id INTEGER PRIMARY KEY,
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    name TEXT NOT NULL,
-    price_extra REAL NOT NULL DEFAULT 0 CHECK (price_extra >= 0),
-    cost_extra REAL NOT NULL DEFAULT 0 CHECK (cost_extra >= 0),
-    UNIQUE(product_id, name)
-);
-CREATE TABLE IF NOT EXISTS plans (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    billing_interval TEXT NOT NULL CHECK (billing_interval IN ('MONTH', 'YEAR')),
-    interval_count INTEGER NOT NULL DEFAULT 1 CHECK (interval_count > 0),
-    minimum_quantity INTEGER NOT NULL DEFAULT 1 CHECK (minimum_quantity > 0),
-    starts_on TEXT,
-    ends_on TEXT,
-    tax_rate REAL NOT NULL DEFAULT 0 CHECK (tax_rate >= 0 AND tax_rate <= 100),
-    allow_pause INTEGER NOT NULL DEFAULT 1,
-    allow_renewal INTEGER NOT NULL DEFAULT 1,
-    allow_cancellation INTEGER NOT NULL DEFAULT 1,
-    active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id INTEGER PRIMARY KEY,
-    number TEXT NOT NULL UNIQUE,
-    customer_id INTEGER NOT NULL REFERENCES customers(id),
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    variant_id INTEGER REFERENCES product_variants(id),
-    plan_id INTEGER NOT NULL REFERENCES plans(id),
-    status TEXT NOT NULL CHECK (status IN ('DRAFT', 'QUOTATION', 'CONFIRMED', 'ACTIVE', 'PAUSED', 'CLOSED')),
-    quantity INTEGER NOT NULL CHECK (quantity > 0),
-    unit_price REAL NOT NULL CHECK (unit_price >= 0),
-    discount_percent REAL NOT NULL DEFAULT 0 CHECK (discount_percent >= 0 AND discount_percent <= 100),
-    start_date TEXT NOT NULL,
-    next_billing_date TEXT NOT NULL,
-    end_date TEXT,
-    auto_renew INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS invoices (
-    id INTEGER PRIMARY KEY,
-    number TEXT NOT NULL UNIQUE,
-    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id),
-    billing_period_start TEXT NOT NULL,
-    issue_date TEXT NOT NULL,
-    due_date TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('DRAFT', 'CONFIRMED', 'PAID', 'OVERDUE', 'CANCELLED')),
-    subtotal REAL NOT NULL,
-    discount_amount REAL NOT NULL,
-    tax_rate REAL NOT NULL,
-    tax_amount REAL NOT NULL,
-    total REAL NOT NULL,
-    amount_paid REAL NOT NULL DEFAULT 0,
-    UNIQUE(subscription_id, billing_period_start)
-);
-CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY,
-    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
-    amount REAL NOT NULL CHECK (amount > 0),
-    method TEXT NOT NULL,
-    paid_at TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT ''
-);
-"""
+def rel_id(value):
+    return value[0] if isinstance(value, list) and value else None
 
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+def rel_name(value):
+    return value[1] if isinstance(value, list) and len(value) > 1 else None
 
 
-def date_string(value: date | None = None) -> str:
-    return (value or date.today()).isoformat()
+def rel_ids(value):
+    return value if isinstance(value, list) else []
 
 
-def add_period(value: date, interval: str, count: int = 1) -> date:
-    months = count if interval == "MONTH" else 12 * count
-    month_index = value.month - 1 + months
-    year = value.year + month_index // 12
-    month = month_index % 12 + 1
-    day = min(value.day, calendar.monthrange(year, month)[1])
-    return date(year, month, day)
+def page_args(query):
+    try:
+        page = max(1, int(query.get("page", ["1"])[0]))
+        limit = min(MAX_LIMIT, max(1, int(query.get("limit", ["20"])[0])))
+    except ValueError:
+        raise ValueError("page and limit must be integers") from None
+    return page, limit, (page - 1) * limit
 
 
-def seed_demo(connection: sqlite3.Connection) -> None:
-    if connection.execute("SELECT COUNT(*) FROM customers").fetchone()[0]:
-        return
+def fields(model, names):
+    available = ODOO.fields(model)
+    return [name for name in names if name == "id" or name in available]
 
+
+def search_read(model, domain, names, limit=20, offset=0, order=None):
+    params = {"domain": domain, "fields": fields(model, names), "limit": limit, "offset": offset}
+    if order:
+        params["order"] = order
+    return ODOO.call(model, "search_read", **params)
+
+
+def read_all(model, domain, names):
+    out, offset = [], 0
+    while True:
+        rows = search_read(model, domain, names, limit=MAX_LIMIT, offset=offset)
+        out.extend(rows)
+        if len(rows) < MAX_LIMIT:
+            return out
+        offset += len(rows)
+
+
+def paged(model, domain, names, query, mapper):
+    page, limit, offset = page_args(query)
+    total = ODOO.call(model, "search_count", domain=domain)
+    rows = search_read(model, domain, names, limit=limit, offset=offset, order="id desc")
+    return {"items": [mapper(row) for row in rows], "pagination": {"page": page, "limit": limit, "total": total}}
+
+
+def customer(row):
+    return {"id": row.get("id"), "name": row.get("name"), "email": row.get("email") or "", "phone": row.get("phone") or "", "isCompany": bool(row.get("is_company"))}
+
+
+def product(row):
+    return {
+        "id": row.get("id"), "name": row.get("name"),
+        "productType": "SERVICE" if row.get("type") == "service" else "GOODS",
+        "salesPrice": row.get("list_price", 0), "costPrice": row.get("standard_price", 0),
+        "notes": row.get("description_sale") or "", "active": bool(row.get("active", True)),
+        "variantIds": rel_ids(row.get("product_variant_ids")), "currency": CURRENCY,
+    }
+
+
+def products_with_variants(rows):
+    variant_ids = sorted({variant_id for row in rows for variant_id in rel_ids(row.get("product_variant_ids"))})
+    variants_by_template = {}
+    if variant_ids:
+        variant_rows = ODOO.call(
+            "product.product", "read", ids=variant_ids,
+            fields=fields("product.product", ["id", "name", "product_tmpl_id", "list_price", "standard_price", "default_code", "product_template_attribute_value_ids"]),
+        )
+        value_ids = sorted({value_id for variant in variant_rows for value_id in rel_ids(variant.get("product_template_attribute_value_ids"))})
+        values_by_id = {}
+        if value_ids:
+            value_rows = ODOO.call("product.template.attribute.value", "read", ids=value_ids, fields=["id", "name"])
+            values_by_id = {value["id"]: value.get("name") for value in value_rows}
+        for variant in variant_rows:
+            template_id = rel_id(variant.get("product_tmpl_id"))
+            variants_by_template.setdefault(template_id, []).append({
+                "id": variant.get("id"), "name": variant.get("name"), "salesPrice": variant.get("list_price", 0),
+                "costPrice": variant.get("standard_price", 0), "sku": variant.get("default_code") or "",
+                "attributes": [values_by_id[value_id] for value_id in rel_ids(variant.get("product_template_attribute_value_ids")) if value_id in values_by_id],
+            })
+    result = []
+    for row in rows:
+        item = product(row)
+        item["variants"] = variants_by_template.get(row["id"], [])
+        result.append(item)
+    return result
+
+
+def plan(row):
+    count = row.get("billing_period_value") or 1
+    unit = row.get("billing_period_unit") or "month"
+    return {
+        "id": row.get("id"), "name": row.get("name"), "billingInterval": f"{count} {unit}{'' if count == 1 else 's'}",
+        "billingPeriodValue": count, "billingPeriodUnit": unit,
+        "minimumQuantity": row.get("minimum_quantity"), "startsOn": row.get("date_start") or row.get("start_date"),
+        "endsOn": row.get("date_end") or row.get("end_date"), "active": bool(row.get("active", True)),
+    }
+
+
+def subscription_status(row):
+    value = str(row.get("subscription_state") or row.get("state") or "draft").lower()
+    if "progress" in value or value in {"active", "sale"}:
+        return "ACTIVE"
+    if "pause" in value:
+        return "PAUSED"
+    if any(word in value for word in ("closed", "churn", "cancel", "expired")):
+        return "CLOSED"
+    if any(word in value for word in ("draft", "sent", "quotation", "new")):
+        return "QUOTATION"
+    if any(word in value for word in ("renew", "upsell")):
+        return "CONFIRMED"
+    return value.upper()
+
+
+def monthly_equivalent(amount, count, unit):
+    periods = max(float(count or 1), 1.0)
+    if unit == "year":
+        periods *= 12
+    elif unit == "week":
+        return float(amount or 0) * 52 / (periods * 12)
+    return float(amount or 0) / periods
+
+
+def subscriptions(rows):
+    line_ids = sorted({line for row in rows for line in rel_ids(row.get("order_line"))})
+    by_order = {}
+    if line_ids:
+        line_rows = ODOO.call("sale.order.line", "read", ids=line_ids, fields=fields("sale.order.line", ["id", "order_id", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "discount"]))
+        for line in line_rows:
+            by_order.setdefault(rel_id(line.get("order_id")), []).append(line)
+    plan_ids = sorted({rel_id(row.get("plan_id")) for row in rows if rel_id(row.get("plan_id"))})
+    plans_by_id = {}
+    if plan_ids:
+        plan_rows = ODOO.call("sale.subscription.plan", "read", ids=plan_ids, fields=fields("sale.subscription.plan", ["id", "billing_period_value", "billing_period_unit"]))
+        plans_by_id = {row["id"]: row for row in plan_rows}
+    out = []
+    for row in rows:
+        lines = by_order.get(row["id"], [])
+        recurring = float(row.get("recurring_total") or 0) or sum(float(line.get("price_subtotal") or 0) for line in lines)
+        plan_row = plans_by_id.get(rel_id(row.get("plan_id")), {})
+        period = plan_row.get("billing_period_value") or 1
+        unit = plan_row.get("billing_period_unit") or "month"
+        monthly = float(row.get("recurring_monthly") or 0)
+        if not monthly:
+            monthly = monthly_equivalent(recurring, period, unit)
+        first = lines[0] if lines else {}
+        out.append({
+            "id": row.get("id"), "number": row.get("name"), "customerName": rel_name(row.get("partner_id")),
+            "productName": rel_name(first.get("product_id")), "variantName": None, "planName": rel_name(row.get("plan_id")),
+            "status": subscription_status(row), "billingInterval": f"{period} {unit}{'' if period == 1 else 's'}",
+            "startDate": row.get("start_date"), "nextBillingDate": row.get("next_invoice_date"), "endDate": row.get("end_date"),
+            "quantity": sum(float(line.get("product_uom_qty") or 0) for line in lines),
+            "unitPrice": float(first.get("price_unit") or 0), "discountPercent": float(first.get("discount") or 0),
+            "recurringAmount": round(recurring, 2), "monthlyRecurringRevenue": round(monthly, 2),
+            "currency": CURRENCY, "autoRenew": subscription_status(row) == "ACTIVE",
+        })
+    return out
+
+
+def subscription_domain(query):
+    meta = ODOO.fields("sale.order")
+    domain = [["is_subscription", "=", True]] if "is_subscription" in meta else []
+    wanted = query.get("status", [""])[0].upper()
+    state_field = "subscription_state" if "subscription_state" in meta else "state"
+    parts = {"ACTIVE": ("progress",), "PAUSED": ("pause",), "CLOSED": ("closed", "churn", "cancel")}
+    if wanted in parts and state_field in meta:
+        choices = meta[state_field].get("selection") or []
+        matches = [key for key, _label in choices if any(p in str(key).lower() for p in parts[wanted])]
+        domain.append([state_field, "in", matches or [parts[wanted][0]]])
+    elif wanted == "QUOTATION":
+        domain.append(["state", "in", ["draft", "sent"]])
+    return domain
+
+
+def invoice_status(row):
+    if row.get("state") == "draft":
+        return "DRAFT"
+    if row.get("state") == "cancel":
+        return "CANCELLED"
+    if float(row.get("amount_residual") or 0) <= 0 or row.get("payment_state") == "paid":
+        return "PAID"
+    if row.get("invoice_date_due") and row["invoice_date_due"] < date.today().isoformat():
+        return "OVERDUE"
+    return "CONFIRMED"
+
+
+def invoices(query):
+    model = "account.move"
+    domain = [["move_type", "=", "out_invoice"]]
+    status = query.get("status", [""])[0].upper()
+    if status == "DRAFT":
+        domain.append(["state", "=", "draft"])
+    elif status == "CANCELLED":
+        domain.append(["state", "=", "cancel"])
+    elif status == "PAID":
+        domain.append(["payment_state", "=", "paid"])
+    elif status == "OVERDUE":
+        domain.extend([["state", "=", "posted"], ["amount_residual", ">", 0], ["invoice_date_due", "<", date.today().isoformat()]])
+    elif status in {"CONFIRMED", "OPEN"}:
+        domain.extend([["state", "=", "posted"], ["amount_residual", ">", 0]])
+    page_no, limit, offset = page_args(query)
+    total = ODOO.call(model, "search_count", domain=domain)
+    rows = search_read(model, domain, ["id", "name", "partner_id", "invoice_origin", "invoice_date", "invoice_date_due", "state", "payment_state", "amount_untaxed", "amount_tax", "amount_total", "amount_residual", "invoice_line_ids"], limit, offset, "id desc")
+    line_ids = sorted({line_id for row in rows for line_id in rel_ids(row.get("invoice_line_ids"))})
+    discounts = {}
+    if line_ids:
+        lines = ODOO.call("account.move.line", "read", ids=line_ids, fields=fields("account.move.line", ["id", "move_id", "quantity", "price_unit", "discount", "display_type"]))
+        for line in lines:
+            if line.get("display_type") in {"line_section", "line_note"}:
+                continue
+            move_id = rel_id(line.get("move_id"))
+            discounts[move_id] = discounts.get(move_id, 0) + float(line.get("quantity") or 0) * float(line.get("price_unit") or 0) * float(line.get("discount") or 0) / 100
+    items = []
+    for row in rows:
+        total_amount, due = float(row.get("amount_total") or 0), float(row.get("amount_residual") or 0)
+        items.append({
+            "id": row.get("id"), "number": row.get("name"), "customerName": rel_name(row.get("partner_id")),
+            "subscriptionId": row.get("invoice_origin") or "", "issueDate": row.get("invoice_date"), "dueDate": row.get("invoice_date_due"),
+            "status": invoice_status(row), "subtotal": round(float(row.get("amount_untaxed") or 0), 2),
+            "discountAmount": round(discounts.get(row["id"], 0), 2), "taxAmount": round(float(row.get("amount_tax") or 0), 2),
+            "total": round(total_amount, 2), "amountPaid": round(max(total_amount - due, 0), 2),
+            "balanceDue": round(due, 2), "currency": CURRENCY,
+        })
+    return {"items": items, "pagination": {"page": page_no, "limit": limit, "total": total}}
+
+
+def payments(query):
+    model = "account.payment"
+    domain = [["payment_type", "=", "inbound"], ["state", "in", ["paid", "in_process"]]]
+    if query.get("from"):
+        domain.append(["date", ">=", query["from"][0]])
+    if query.get("to"):
+        domain.append(["date", "<=", query["to"][0]])
+    page_no, limit, offset = page_args(query)
+    total = ODOO.call(model, "search_count", domain=domain)
+    rows = search_read(model, domain, ["id", "name", "partner_id", "amount", "date", "state", "ref", "journal_id", "payment_method_line_id", "reconciled_invoice_ids"], limit, offset, "date desc, id desc")
+    invoice_ids = sorted({invoice_id for row in rows for invoice_id in rel_ids(row.get("reconciled_invoice_ids"))})
+    invoice_names = {}
+    if invoice_ids:
+        invoice_rows = ODOO.call("account.move", "read", ids=invoice_ids, fields=["id", "name"])
+        invoice_names = {row["id"]: row.get("name") for row in invoice_rows}
+    items = [{
+        "id": row.get("id"), "invoiceId": next(iter(rel_ids(row.get("reconciled_invoice_ids"))), None),
+        "invoiceNumber": next((invoice_names[i] for i in rel_ids(row.get("reconciled_invoice_ids")) if i in invoice_names), None),
+        "customerName": rel_name(row.get("partner_id")), "amount": round(float(row.get("amount") or 0), 2),
+        "method": rel_name(row.get("payment_method_line_id")) or rel_name(row.get("journal_id")) or "",
+        "paidAt": row.get("date"), "note": row.get("ref") or row.get("name") or "", "currency": CURRENCY, "status": row.get("state"),
+    } for row in rows]
+    return {"items": items, "pagination": {"page": page_no, "limit": limit, "total": total}}
+
+
+def dashboard_summary():
+    active_domain = subscription_domain({"status": ["ACTIVE"]})
+    active_rows = read_all("sale.order", active_domain, ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"])
+    active = subscriptions(active_rows)
     today = date.today()
-    start = date(2026, 10, 31)
-    next_bill = add_period(start, "MONTH")
-    end = add_period(start, "YEAR")
-    customer_id = connection.execute(
-        "INSERT INTO customers(name, email, created_at) VALUES (?, ?, ?)",
-        ("Sunmart Hackathon Demo", "demo@brightloop.example", date_string(today)),
-    ).lastrowid
-    product_id = connection.execute(
-        "INSERT INTO products(name, product_type, sales_price, cost_price, notes) VALUES (?, ?, ?, ?, ?)",
-        ("Brightloop Inventory", "SERVICE", 1000, 300, "Monthly inventory-management service"),
-    ).lastrowid
-    standard_variant = connection.execute(
-        "INSERT INTO product_variants(product_id, name, price_extra, cost_extra) VALUES (?, ?, ?, ?)",
-        (product_id, "Standard", 0, 0),
-    ).lastrowid
-    connection.execute(
-        "INSERT INTO product_variants(product_id, name, price_extra, cost_extra) VALUES (?, ?, ?, ?)",
-        (product_id, "Odoo", 560, 0),
-    )
-    plan_id = connection.execute(
-        """INSERT INTO plans(name, billing_interval, interval_count, minimum_quantity,
-           starts_on, ends_on, tax_rate, allow_pause, allow_renewal, allow_cancellation)
-           VALUES (?, 'MONTH', 1, 1, ?, ?, 18, 1, 1, 1)""",
-        ("Brightloop Monthly", date_string(start), date_string(end)),
-    ).lastrowid
-    subscription_id = connection.execute(
-        """INSERT INTO subscriptions(number, customer_id, product_id, variant_id, plan_id,
-           status, quantity, unit_price, discount_percent, start_date, next_billing_date,
-           end_date, auto_renew, created_at)
-           VALUES ('SUB-0001', ?, ?, ?, ?, 'ACTIVE', 10, 1000, 10, ?, ?, ?, 1, ?)""",
-        (customer_id, product_id, standard_variant, plan_id, date_string(start), date_string(next_bill), date_string(end), date_string(today)),
-    ).lastrowid
-
-    subtotal = 10000.0
-    discount = 1000.0
-    tax = round((subtotal - discount) * 0.18, 2)
-    connection.execute(
-        """INSERT INTO invoices(number, subscription_id, billing_period_start, issue_date,
-           due_date, status, subtotal, discount_amount, tax_rate, tax_amount, total, amount_paid)
-           VALUES ('INV-0001', ?, ?, ?, ?, 'CONFIRMED', ?, ?, 18, ?, ?, 0)""",
-        (subscription_id, date_string(start), date_string(start), date_string(start + timedelta(days=7)), subtotal, discount, tax, round(subtotal - discount + tax, 2)),
-    )
-    connection.commit()
-
-
-def initialize() -> None:
-    with connect() as connection:
-        connection.executescript(SCHEMA)
-        seed_demo(connection)
-
-
-def row_dict(row: sqlite3.Row | None) -> dict | None:
-    return dict(row) if row is not None else None
-
-
-def subscription_record(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    plan = connection.execute("SELECT * FROM plans WHERE id = ?", (row["plan_id"],)).fetchone()
-    customer = connection.execute("SELECT name FROM customers WHERE id = ?", (row["customer_id"],)).fetchone()
-    product = connection.execute("SELECT name FROM products WHERE id = ?", (row["product_id"],)).fetchone()
-    variant = connection.execute("SELECT name FROM product_variants WHERE id = ?", (row["variant_id"],)).fetchone() if row["variant_id"] else None
-    months = plan["interval_count"] * (12 if plan["billing_interval"] == "YEAR" else 1)
-    recurring = row["unit_price"] * row["quantity"] * (1 - row["discount_percent"] / 100)
+    outstanding_rows = read_all("account.move", [["move_type", "=", "out_invoice"], ["state", "=", "posted"], ["amount_residual", ">", 0]], ["id", "amount_residual", "invoice_date_due"])
+    first_month_day = today.replace(day=1).isoformat()
+    collected_rows = read_all("account.payment", [["payment_type", "=", "inbound"], ["state", "in", ["paid", "in_process"]], ["date", ">=", first_month_day], ["date", "<=", today.isoformat()]], ["id", "amount"])
+    overdue_rows = [row for row in outstanding_rows if row.get("invoice_date_due") and row["invoice_date_due"] < today.isoformat()]
     return {
-        "id": row["id"],
-        "number": row["number"],
-        "customerName": customer["name"],
-        "productName": product["name"],
-        "variantName": variant["name"] if variant else None,
-        "planName": plan["name"],
-        "status": row["status"],
-        "billingInterval": f"{plan['interval_count']} {plan['billing_interval'].lower()}{'s' if plan['interval_count'] != 1 else ''}",
-        "startDate": row["start_date"],
-        "nextBillingDate": row["next_billing_date"],
-        "endDate": row["end_date"],
-        "quantity": row["quantity"],
-        "unitPrice": round(row["unit_price"], 2),
-        "discountPercent": round(row["discount_percent"], 2),
-        "recurringAmount": round(recurring, 2),
-        "monthlyRecurringRevenue": round(recurring / months, 2),
-        "currency": CURRENCY,
-        "autoRenew": bool(row["auto_renew"]),
+        "currency": CURRENCY, "activeSubscriptions": len(active_rows),
+        "monthlyRecurringRevenue": round(sum(row["monthlyRecurringRevenue"] for row in active), 2),
+        "revenueCollectedThisMonth": round(sum(float(row.get("amount") or 0) for row in collected_rows), 2),
+        "outstandingAmount": round(sum(float(row.get("amount_residual") or 0) for row in outstanding_rows), 2),
+        "overdueAmount": round(sum(float(row.get("amount_residual") or 0) for row in overdue_rows), 2),
+        "overdueInvoicesCount": len(overdue_rows),
     }
 
 
-def invoice_record(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    sub = connection.execute("SELECT number, customer_id FROM subscriptions WHERE id = ?", (row["subscription_id"],)).fetchone()
-    customer = connection.execute("SELECT name FROM customers WHERE id = ?", (sub["customer_id"],)).fetchone()
-    balance = round(max(row["total"] - row["amount_paid"], 0), 2)
-    status = row["status"]
-    if status == "CONFIRMED" and balance > 0 and row["due_date"] < date_string():
-        status = "OVERDUE"
-    return {
-        "id": row["id"],
-        "number": row["number"],
-        "customerName": customer["name"],
-        "subscriptionId": sub["number"],
-        "issueDate": row["issue_date"],
-        "dueDate": row["due_date"],
-        "status": status,
-        "subtotal": round(row["subtotal"], 2),
-        "discountAmount": round(row["discount_amount"], 2),
-        "taxAmount": round(row["tax_amount"], 2),
-        "total": round(row["total"], 2),
-        "amountPaid": round(row["amount_paid"], 2),
-        "balanceDue": balance,
-        "currency": CURRENCY,
-    }
+def find_name(model, name, names, domain=None):
+    rows = search_read(model, list(domain or []) + [["name", "=", name]], names, limit=1)
+    if not rows:
+        raise OdooAPIError(404, f"No {model} record named {name} was found.")
+    return rows[0]
 
 
-def paginated(items: list[dict], page: int, limit: int, total: int) -> dict:
-    return {"items": items, "pagination": {"page": page, "limit": limit, "total": total}}
+def body_json(handler):
+    try:
+        size = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        raise ValueError("Invalid Content-Length") from None
+    if size > 1_000_000:
+        raise ValueError("Request body is too large")
+    if not size:
+        return {}
+    try:
+        value = json.loads(handler.rfile.read(size).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Request body must be valid JSON") from None
+    if not isinstance(value, dict):
+        raise ValueError("Request body must be a JSON object")
+    return value
 
 
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        self.status = status
-        self.message = message
+def int_field(body, key):
+    try:
+        return int(body[key])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer") from None
+
+
+def create_customer(body):
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("name is required")
+    vals = {"name": name}
+    for source, target in (("email", "email"), ("phone", "phone"), ("isCompany", "is_company")):
+        if source in body:
+            vals[target] = body[source]
+    record_id = ODOO.call("res.partner", "create", vals=vals)
+    return customer(ODOO.call("res.partner", "read", ids=[record_id], fields=["id", "name", "email", "phone", "is_company"])[0])
+
+
+def create_product(body):
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("name is required")
+    kind = str(body.get("productType", "SERVICE")).upper()
+    if kind not in {"SERVICE", "GOODS"}:
+        raise ValueError("productType must be SERVICE or GOODS")
+    try:
+        sales, cost = float(body.get("salesPrice", 0)), float(body.get("costPrice", 0))
+    except (TypeError, ValueError):
+        raise ValueError("salesPrice and costPrice must be numbers") from None
+    if sales < 0 or cost < 0:
+        raise ValueError("prices cannot be negative")
+    vals = {"name": name, "type": "service" if kind == "SERVICE" else "consu", "list_price": sales, "standard_price": cost, "description_sale": str(body.get("notes", ""))}
+    if "active" in body:
+        vals["active"] = bool(body["active"])
+    record_id = ODOO.call("product.template", "create", vals=vals)
+    row = ODOO.call("product.template", "read", ids=[record_id], fields=fields("product.template", ["id", "name", "type", "list_price", "standard_price", "description_sale", "active", "product_variant_ids"]))[0]
+    return products_with_variants([row])[0]
+
+
+def create_plan(body):
+    name = str(body.get("name", "")).strip()
+    unit = str(body.get("billingPeriodUnit", "month")).lower().rstrip("s")
+    try:
+        count = int(body.get("billingPeriodValue", 1))
+    except (TypeError, ValueError):
+        raise ValueError("billingPeriodValue must be a positive integer") from None
+    if not name or unit not in {"week", "month", "year"} or count < 1:
+        raise ValueError("Provide a name and a positive billing interval in weeks, months, or years")
+    meta = ODOO.fields("sale.subscription.plan")
+    vals = {"name": name, "billing_period_unit": unit, "billing_period_value": count}
+    for key in ("minimumQuantity", "startsOn", "endsOn"):
+        model_field = {"minimumQuantity": "minimum_quantity", "startsOn": "date_start", "endsOn": "date_end"}[key]
+        if key in body and model_field in meta:
+            vals[model_field] = body[key]
+    record_id = ODOO.call("sale.subscription.plan", "create", vals=vals)
+    return plan(ODOO.call("sale.subscription.plan", "read", ids=[record_id], fields=fields("sale.subscription.plan", ["id", "name", "billing_period_value", "billing_period_unit", "minimum_quantity", "date_start", "date_end", "start_date", "end_date", "active"]))[0])
+
+
+def create_subscription(body):
+    customer_id, template_id, plan_id = int_field(body, "customerId"), int_field(body, "productId"), int_field(body, "planId")
+    try:
+        quantity, discount = float(body.get("quantity", 1)), float(body.get("discountPercent", 0))
+    except (TypeError, ValueError):
+        raise ValueError("quantity and discountPercent must be numbers") from None
+    if quantity <= 0 or not 0 <= discount <= 100:
+        raise ValueError("quantity must be positive and discountPercent must be between 0 and 100")
+    plan_row = ODOO.call("sale.subscription.plan", "read", ids=[plan_id], fields=fields("sale.subscription.plan", ["id", "minimum_quantity", "date_start", "date_end", "start_date", "end_date"]))[0]
+    minimum = float(plan_row.get("minimum_quantity") or 0)
+    if minimum and quantity < minimum:
+        raise OdooAPIError(400, f"This plan requires a minimum quantity of {minimum:g}.")
+    available_from = plan_row.get("date_start") or plan_row.get("start_date")
+    available_until = plan_row.get("date_end") or plan_row.get("end_date")
+    if available_from and date.today().isoformat() < available_from:
+        raise OdooAPIError(400, f"This plan is available from {available_from}.")
+    if available_until and date.today().isoformat() > available_until:
+        raise OdooAPIError(400, f"This plan was available only until {available_until}.")
+    template = ODOO.call("product.template", "read", ids=[template_id], fields=["id", "product_variant_ids", "list_price"])[0]
+    variants = rel_ids(template.get("product_variant_ids"))
+    if not variants:
+        raise OdooAPIError(400, "This product does not have a sellable variant.")
+    meta = ODOO.fields("sale.order")
+    required = {"partner_id", "plan_id", "order_line"}
+    if not required.issubset(meta):
+        raise OdooAPIError(501, "Subscription quotation fields are not available in this Odoo database.")
+    line = {"product_id": variants[0], "product_uom_qty": quantity, "price_unit": float(body.get("unitPrice", template.get("list_price", 0))), "discount": discount}
+    vals = {"partner_id": customer_id, "plan_id": plan_id, "order_line": [(0, 0, line)]}
+    if body.get("startDate") and "start_date" in meta:
+        vals["start_date"] = body["startDate"]
+    order_id = ODOO.call("sale.order", "create", vals=vals)
+    ODOO.call("sale.order", "action_confirm", ids=[order_id])
+    row = ODOO.call("sale.order", "read", ids=[order_id], fields=fields("sale.order", ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"]))[0]
+    return subscriptions([row])[0]
+
+
+def subscription_action(number, action, body):
+    row = find_name("sale.order", number, ["id"], [["is_subscription", "=", True]])
+    method = {"pause": "pause_subscription", "resume": "resume_subscription", "cancel": "set_close"}[action]
+    args = {"ids": [row["id"]]}
+    if action == "cancel":
+        args.update({"close_reason_id": body.get("closeReasonId") or False, "renew": False})
+    ODOO.call("sale.order", method, **args)
+    row = ODOO.call("sale.order", "read", ids=[row["id"]], fields=fields("sale.order", ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"]))[0]
+    return subscriptions([row])[0]
+
+
+def post_invoice(number):
+    row = find_name("account.move", number, ["id", "state"], [["move_type", "=", "out_invoice"]])
+    if row.get("state") != "draft":
+        raise OdooAPIError(409, "Only a draft invoice can be posted.")
+    ODOO.call("account.move", "action_post", ids=[row["id"]])
+    return {"number": number, "status": "POSTED", "message": "Invoice posted in Odoo."}
+
+
+def payment_options():
+    journals = search_read("account.journal", [["type", "in", ["bank", "cash"]]], ["id", "name", "type"], 100)
+    methods = search_read("account.payment.method.line", [["payment_type", "=", "inbound"]], ["id", "name", "journal_id"], 100)
+    return {"journals": journals, "paymentMethods": [{"id": row["id"], "name": row["name"], "journalId": rel_id(row.get("journal_id"))} for row in methods]}
+
+
+def register_payment(body):
+    number = str(body.get("invoiceNumber", "")).strip()
+    if not number:
+        raise ValueError("invoiceNumber is required")
+    try:
+        amount = float(body["amount"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("amount must be a number") from None
+    if amount <= 0:
+        raise ValueError("amount must be greater than zero")
+    journal_id, method_id = int_field(body, "journalId"), int_field(body, "paymentMethodLineId")
+    invoice = find_name("account.move", number, ["id", "state", "amount_residual"], [["move_type", "=", "out_invoice"]])
+    if invoice.get("state") != "posted":
+        raise OdooAPIError(409, "Post the invoice in Odoo before registering a payment.")
+    balance = float(invoice.get("amount_residual") or 0)
+    if amount > balance:
+        raise OdooAPIError(409, f"Payment exceeds the remaining invoice balance of {balance:.2f}.")
+    wizard_fields = ODOO.fields("account.payment.register")
+    vals = {"amount": amount, "journal_id": journal_id, "payment_method_line_id": method_id}
+    for name, value in (("payment_date", body.get("paidAt") or date.today().isoformat()), ("communication", body.get("note") or number)):
+        if name in wizard_fields:
+            vals[name] = value
+    context = {"active_model": "account.move", "active_ids": [invoice["id"]]}
+    wizard_id = ODOO.call("account.payment.register", "create", vals=vals, context=context)
+    result = ODOO.call("account.payment.register", "action_create_payments", ids=[wizard_id], context=context)
+    return {"invoiceNumber": number, "amount": round(amount, 2), "result": result, "message": "Odoo payment registration completed."}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BrightloopDemo/0.1"
+    server_version = "BrightloopOdooBridge/1.0"
 
-    def log_message(self, format_string: str, *args) -> None:
-        print(f"{self.address_string()} - {format_string % args}")
+    def log_message(self, format_string, *args):
+        # The request body and authorization header are never logged.
+        super().log_message(format_string, *args)
 
-    def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self.end_headers()
-
-    def send_json(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def send_json(self, status, payload):
+        data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", os.environ.get("CORS_ORIGIN", "*"))
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
-        self.wfile.write(body)
+        if status != 204:
+            self.wfile.write(data)
 
-    def read_json(self) -> dict:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 1_000_000:
-                raise ApiError(413, "Request body is too large")
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            if not isinstance(payload, dict):
-                raise ApiError(400, "JSON request body must be an object")
-            return payload
-        except (ValueError, json.JSONDecodeError):
-            raise ApiError(400, "Request body must contain valid JSON") from None
+    def authorized(self):
+        if not APP_API_TOKEN:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        if supplied.lower().startswith("bearer "):
+            supplied = supplied[7:].strip()
+        return hmac.compare_digest(supplied, APP_API_TOKEN)
 
-    def query(self) -> tuple[str, dict[str, list[str]]]:
+    def do_OPTIONS(self):
+        self.send_json(204, {})
+
+    def do_GET(self):
         parsed = urlparse(self.path)
-        return parsed.path.rstrip("/") or "/", parse_qs(parsed.query)
-
-    def do_GET(self) -> None:
-        path, query = self.query()
+        path, query = unquote(parsed.path.rstrip("/")) or "/", parse_qs(parsed.query)
+        if path == "/health":
+            return self.send_json(200, {"status": "ok", "odooConfigured": ODOO.configured, "source": "odoo"})
+        if not self.authorized():
+            return self.send_json(401, {"error": "A valid app bearer token is required."})
         try:
-            with connect() as connection:
-                if path == "/" or path == "/health":
-                    return self.send_json(200, {"service": "Brightloop Subscription API", "status": "ok", "database": "local SQLite demo"})
-                if path == "/api/v1/dashboard/summary":
-                    return self.send_json(200, self.dashboard_summary(connection))
-                if path == "/api/v1/subscriptions":
-                    return self.list_subscriptions(connection, query)
-                if path.startswith("/api/v1/subscriptions/"):
-                    number = path.rsplit("/", 1)[1]
-                    row = connection.execute("SELECT * FROM subscriptions WHERE number = ?", (number,)).fetchone()
-                    if not row:
-                        raise ApiError(404, "Subscription not found")
-                    return self.send_json(200, subscription_record(connection, row))
-                if path == "/api/v1/invoices":
-                    return self.list_invoices(connection, query)
-                if path == "/api/v1/payments":
-                    return self.list_payments(connection, query)
-                if path == "/api/v1/customers":
-                    rows = connection.execute("SELECT id, name, email, created_at AS createdAt FROM customers ORDER BY name").fetchall()
-                    return self.send_json(200, {"items": [dict(row) for row in rows]})
-                if path == "/api/v1/products":
-                    rows = connection.execute("SELECT * FROM products WHERE active = 1 ORDER BY name").fetchall()
-                    products = []
-                    for row in rows:
-                        item = dict(row)
-                        item["salesPrice"] = item.pop("sales_price")
-                        item["costPrice"] = item.pop("cost_price")
-                        item["productType"] = item.pop("product_type")
-                        item["variants"] = [dict(variant) for variant in connection.execute("SELECT id, name, price_extra AS priceExtra, cost_extra AS costExtra FROM product_variants WHERE product_id = ? ORDER BY id", (row["id"],)).fetchall()]
-                        products.append(item)
-                    return self.send_json(200, {"items": products})
-                if path == "/api/v1/plans":
-                    rows = connection.execute("SELECT * FROM plans WHERE active = 1 ORDER BY name").fetchall()
-                    return self.send_json(200, {"items": [self.plan_json(row) for row in rows]})
-            raise ApiError(404, "Endpoint not found")
-        except ApiError as error:
-            self.send_json(error.status, {"error": error.message})
-        except sqlite3.Error as error:
-            self.send_json(500, {"error": "Database error", "details": str(error)})
+            if path == "/api/v1/health/odoo":
+                companies = search_read("res.company", [], ["id", "name"], 1)
+                return self.send_json(200, {"status": "connected", "odooVersion": "20.0", "company": companies[0].get("name") if companies else None})
+            if path == "/api/v1/dashboard/summary":
+                return self.send_json(200, dashboard_summary())
+            if path == "/api/v1/customers":
+                return self.send_json(200, paged("res.partner", [], ["id", "name", "email", "phone", "is_company"], query, customer))
+            if path == "/api/v1/products":
+                data = paged("product.template", [["active", "=", True]], ["id", "name", "type", "list_price", "standard_price", "description_sale", "active", "product_variant_ids"], query, lambda row: row)
+                data["items"] = products_with_variants(data["items"])
+                return self.send_json(200, data)
+            if path == "/api/v1/plans":
+                return self.send_json(200, paged("sale.subscription.plan", [["active", "=", True]], ["id", "name", "billing_period_value", "billing_period_unit", "minimum_quantity", "date_start", "date_end", "start_date", "end_date", "active"], query, plan))
+            if path == "/api/v1/subscriptions":
+                domain = subscription_domain(query)
+                data = paged("sale.order", domain, ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"], query, lambda row: row)
+                data["items"] = subscriptions(data["items"])
+                return self.send_json(200, data)
+            if path == "/api/v1/billing/due":
+                as_of = query.get("asOf", [date.today().isoformat()])[0]
+                try:
+                    date.fromisoformat(as_of)
+                except ValueError:
+                    raise ValueError("asOf must be YYYY-MM-DD") from None
+                domain = subscription_domain({"status": ["ACTIVE"]}) + [["next_invoice_date", "<=", as_of]]
+                data = paged("sale.order", domain, ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"], query, lambda row: row)
+                data["items"] = subscriptions(data["items"])
+                return self.send_json(200, data)
+            if path == "/api/v1/invoices":
+                return self.send_json(200, invoices(query))
+            if path == "/api/v1/payments":
+                return self.send_json(200, payments(query))
+            if path == "/api/v1/payment-options":
+                return self.send_json(200, payment_options())
+            match = re.fullmatch(r"/api/v1/subscriptions/([^/]+)", path)
+            if match:
+                number = unquote(match.group(1))
+                row = find_name("sale.order", number, ["id", "name", "partner_id", "plan_id", "subscription_state", "state", "is_subscription", "start_date", "next_invoice_date", "end_date", "order_line", "recurring_monthly", "recurring_total"], [["is_subscription", "=", True]])
+                return self.send_json(200, subscriptions([row])[0])
+            return self.send_json(404, {"error": "Route not found."})
+        except ValueError as error:
+            return self.send_json(400, {"error": str(error)})
+        except OdooAPIError as error:
+            return self.send_json(error.status, {"error": error.message})
+        except Exception:
+            return self.send_json(500, {"error": "Unexpected backend error. Check local server logs."})
 
-    def do_POST(self) -> None:
-        path, _query = self.query()
+    def do_POST(self):
+        if not self.authorized():
+            return self.send_json(401, {"error": "A valid app bearer token is required."})
+        path = unquote(urlparse(self.path).path.rstrip("/")) or "/"
         try:
-            data = self.read_json()
-            with connect() as connection:
-                if path == "/api/v1/subscriptions":
-                    return self.create_subscription(connection, data)
-                if path == "/api/v1/products":
-                    return self.create_product(connection, data)
-                if path == "/api/v1/plans":
-                    return self.create_plan(connection, data)
-                if path == "/api/v1/billing/run":
-                    return self.run_billing(connection, data)
-                if path == "/api/v1/payments":
-                    return self.create_payment(connection, data)
-                if path == "/api/v1/customers":
-                    return self.create_customer(connection, data)
-                match = re.fullmatch(r"/api/v1/invoices/([^/]+)/confirm", path)
-                if match:
-                    return self.confirm_invoice(connection, match.group(1))
-                match = re.fullmatch(r"/api/v1/subscriptions/([^/]+)/(pause|resume|renew|cancel)", path)
-                if match:
-                    return self.subscription_action(connection, match.group(1), match.group(2))
-            raise ApiError(404, "Endpoint not found")
-        except ApiError as error:
-            self.send_json(error.status, {"error": error.message})
-        except sqlite3.IntegrityError as error:
-            self.send_json(409, {"error": "Record conflicts with existing data", "details": str(error)})
-        except sqlite3.Error as error:
-            self.send_json(500, {"error": "Database error", "details": str(error)})
-
-    def page_args(self, query: dict[str, list[str]]) -> tuple[int, int]:
-        try:
-            page = max(1, int(query.get("page", ["1"])[0]))
-            limit = min(100, max(1, int(query.get("limit", ["20"])[0])))
-            return page, limit
-        except ValueError:
-            raise ApiError(400, "page and limit must be integers") from None
-
-    def dashboard_summary(self, connection: sqlite3.Connection) -> dict:
-        active = connection.execute("SELECT * FROM subscriptions WHERE status = 'ACTIVE'").fetchall()
-        mrr = sum(subscription_record(connection, row)["monthlyRecurringRevenue"] for row in active)
-        today = date.today()
-        month_start = today.replace(day=1).isoformat()
-        month_end = date_string(today)
-        collected = connection.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE paid_at BETWEEN ? AND ?", (month_start, month_end)).fetchone()[0]
-        invoices = connection.execute("SELECT * FROM invoices WHERE status IN ('CONFIRMED', 'OVERDUE')").fetchall()
-        open_rows = [invoice_record(connection, row) for row in invoices]
-        outstanding = sum(item["balanceDue"] for item in open_rows if item["status"] in ("CONFIRMED", "OVERDUE"))
-        overdue = [item for item in open_rows if item["status"] == "OVERDUE"]
-        return {
-            "currency": CURRENCY,
-            "activeSubscriptions": len(active),
-            "monthlyRecurringRevenue": round(mrr, 2),
-            "revenueCollectedThisMonth": round(collected, 2),
-            "outstandingAmount": round(outstanding, 2),
-            "overdueAmount": round(sum(item["balanceDue"] for item in overdue), 2),
-            "overdueInvoicesCount": len(overdue),
-        }
-
-    def list_subscriptions(self, connection: sqlite3.Connection, query: dict[str, list[str]]) -> None:
-        page, limit = self.page_args(query)
-        status = query.get("status", [None])[0]
-        where = " WHERE status = ?" if status else ""
-        args = (status,) if status else ()
-        total = connection.execute(f"SELECT COUNT(*) FROM subscriptions{where}", args).fetchone()[0]
-        rows = connection.execute(f"SELECT * FROM subscriptions{where} ORDER BY id DESC LIMIT ? OFFSET ?", (*args, limit, (page - 1) * limit)).fetchall()
-        self.send_json(200, paginated([subscription_record(connection, row) for row in rows], page, limit, total))
-
-    def list_invoices(self, connection: sqlite3.Connection, query: dict[str, list[str]]) -> None:
-        page, limit = self.page_args(query)
-        rows = connection.execute("SELECT * FROM invoices ORDER BY issue_date DESC, id DESC").fetchall()
-        items = [invoice_record(connection, row) for row in rows]
-        status = query.get("status", [None])[0]
-        if status:
-            items = [item for item in items if item["status"] == status]
-        total = len(items)
-        offset = (page - 1) * limit
-        self.send_json(200, paginated(items[offset:offset + limit], page, limit, total))
-
-    def list_payments(self, connection: sqlite3.Connection, query: dict[str, list[str]]) -> None:
-        page, limit = self.page_args(query)
-        start = query.get("from", [None])[0]
-        end = query.get("to", [None])[0]
-        where = []
-        args: list[str] = []
-        if start:
-            where.append("p.paid_at >= ?")
-            args.append(start)
-        if end:
-            where.append("p.paid_at <= ?")
-            args.append(end)
-        clause = " WHERE " + " AND ".join(where) if where else ""
-        total = connection.execute(f"SELECT COUNT(*) FROM payments p{clause}", args).fetchone()[0]
-        rows = connection.execute(
-            f"""SELECT p.*, i.number AS invoice_number, s.customer_id, c.name AS customer_name
-                FROM payments p JOIN invoices i ON i.id = p.invoice_id
-                JOIN subscriptions s ON s.id = i.subscription_id
-                JOIN customers c ON c.id = s.customer_id{clause}
-                ORDER BY p.paid_at DESC, p.id DESC LIMIT ? OFFSET ?""",
-            (*args, limit, (page - 1) * limit),
-        ).fetchall()
-        items = [{
-            "id": row["id"], "invoiceId": row["invoice_id"], "invoiceNumber": row["invoice_number"],
-            "customerName": row["customer_name"], "amount": round(row["amount"], 2),
-            "method": row["method"], "paidAt": row["paid_at"], "note": row["note"], "currency": CURRENCY,
-        } for row in rows]
-        self.send_json(200, paginated(items, page, limit, total))
-
-    def plan_json(self, row: sqlite3.Row) -> dict:
-        return {
-            "id": row["id"], "name": row["name"], "billingInterval": row["billing_interval"],
-            "intervalCount": row["interval_count"], "minimumQuantity": row["minimum_quantity"],
-            "startsOn": row["starts_on"], "endsOn": row["ends_on"], "taxRate": row["tax_rate"],
-            "allowPause": bool(row["allow_pause"]), "allowRenewal": bool(row["allow_renewal"]),
-            "allowCancellation": bool(row["allow_cancellation"]),
-        }
-
-    def create_product(self, connection: sqlite3.Connection, data: dict) -> None:
-        name = self.required_text(data, "name")
-        product_type = str(data.get("productType", "SERVICE")).upper()
-        if product_type not in ("SERVICE", "GOODS"):
-            raise ApiError(400, "productType must be SERVICE or GOODS")
-        sales_price = self.number(data, "salesPrice", minimum=0)
-        cost_price = self.number(data, "costPrice", minimum=0, default=0)
-        cursor = connection.execute(
-            "INSERT INTO products(name, product_type, sales_price, cost_price, notes) VALUES (?, ?, ?, ?, ?)",
-            (name, product_type, sales_price, cost_price, str(data.get("notes", ""))),
-        )
-        product_id = cursor.lastrowid
-        variants = data.get("variants", [])
-        if not isinstance(variants, list):
-            raise ApiError(400, "variants must be a list")
-        for variant in variants:
-            if not isinstance(variant, dict) or not variant.get("name"):
-                raise ApiError(400, "Each variant needs a name")
-            connection.execute(
-                "INSERT INTO product_variants(product_id, name, price_extra, cost_extra) VALUES (?, ?, ?, ?)",
-                (product_id, variant["name"], float(variant.get("priceExtra", 0)), float(variant.get("costExtra", 0))),
-            )
-        connection.commit()
-        self.send_json(201, {"id": product_id, "name": name, "productType": product_type, "salesPrice": sales_price, "costPrice": cost_price, "variants": variants})
-
-    def create_customer(self, connection: sqlite3.Connection, data: dict) -> None:
-        name = self.required_text(data, "name")
-        email = self.required_text(data, "email").lower()
-        if "@" not in email:
-            raise ApiError(400, "email must be a valid email address")
-        cursor = connection.execute(
-            "INSERT INTO customers(name, email, created_at) VALUES (?, ?, ?)",
-            (name, email, date_string()),
-        )
-        connection.commit()
-        self.send_json(201, {"id": cursor.lastrowid, "name": name, "email": email, "createdAt": date_string()})
-
-    def create_plan(self, connection: sqlite3.Connection, data: dict) -> None:
-        name = self.required_text(data, "name")
-        interval = str(data.get("billingInterval", "MONTH")).upper()
-        if interval not in ("MONTH", "YEAR"):
-            raise ApiError(400, "billingInterval must be MONTH or YEAR")
-        try:
-            count = int(data.get("intervalCount", 1))
-            minimum = int(data.get("minimumQuantity", 1))
-        except (ValueError, TypeError):
-            raise ApiError(400, "intervalCount and minimumQuantity must be integers") from None
-        if count < 1 or minimum < 1:
-            raise ApiError(400, "intervalCount and minimumQuantity must be at least 1")
-        tax_rate = self.number(data, "taxRate", minimum=0, maximum=100, default=0)
-        cursor = connection.execute(
-            """INSERT INTO plans(name, billing_interval, interval_count, minimum_quantity, starts_on,
-               ends_on, tax_rate, allow_pause, allow_renewal, allow_cancellation)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, interval, count, minimum, data.get("startsOn"), data.get("endsOn"), tax_rate,
-             int(bool(data.get("allowPause", True))), int(bool(data.get("allowRenewal", True))), int(bool(data.get("allowCancellation", True)))),
-        )
-        connection.commit()
-        row = connection.execute("SELECT * FROM plans WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        self.send_json(201, self.plan_json(row))
-
-    def create_subscription(self, connection: sqlite3.Connection, data: dict) -> None:
-        try:
-            customer_id = int(data["customerId"])
-            product_id = int(data["productId"])
-            plan_id = int(data["planId"])
-            quantity = int(data.get("quantity", 1))
-        except (KeyError, ValueError, TypeError):
-            raise ApiError(400, "customerId, productId, and planId are required integers") from None
-        if quantity < 1:
-            raise ApiError(400, "quantity must be at least 1")
-        customer = connection.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
-        product = connection.execute("SELECT * FROM products WHERE id = ? AND active = 1", (product_id,)).fetchone()
-        plan = connection.execute("SELECT * FROM plans WHERE id = ? AND active = 1", (plan_id,)).fetchone()
-        if not customer or not product or not plan:
-            raise ApiError(404, "Customer, active product, or active plan was not found")
-        if quantity < plan["minimum_quantity"]:
-            raise ApiError(400, f"This plan requires at least {plan['minimum_quantity']} units")
-        today = date.today()
-        if plan["starts_on"] and date.fromisoformat(plan["starts_on"]) > today:
-            raise ApiError(400, "This plan is not available yet")
-        if plan["ends_on"] and date.fromisoformat(plan["ends_on"]) < today:
-            raise ApiError(400, "This plan is no longer available")
-        variant_id = data.get("variantId")
-        variant = None
-        if variant_id is not None:
-            variant = connection.execute("SELECT * FROM product_variants WHERE id = ? AND product_id = ?", (int(variant_id), product_id)).fetchone()
-            if not variant:
-                raise ApiError(404, "Variant was not found for this product")
-        unit_price = round(product["sales_price"] + (variant["price_extra"] if variant else 0), 2)
-        discount = self.number(data, "discountPercent", minimum=0, maximum=100, default=0)
-        start = date.fromisoformat(data.get("startDate", date_string()))
-        number = self.next_number(connection, "subscriptions", "number", "SUB-")
-        next_bill = add_period(start, plan["billing_interval"], plan["interval_count"])
-        end_date = data.get("endDate")
-        cursor = connection.execute(
-            """INSERT INTO subscriptions(number, customer_id, product_id, variant_id, plan_id,
-               status, quantity, unit_price, discount_percent, start_date, next_billing_date,
-               end_date, auto_renew, created_at)
-               VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (number, customer_id, product_id, variant["id"] if variant else None, plan_id,
-             quantity, unit_price, discount, date_string(start), date_string(next_bill), end_date,
-             int(bool(data.get("autoRenew", True))), date_string()),
-        )
-        connection.commit()
-        row = connection.execute("SELECT * FROM subscriptions WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        self.send_json(201, subscription_record(connection, row))
-
-    def subscription_action(self, connection: sqlite3.Connection, number: str, action: str) -> None:
-        row = connection.execute("SELECT * FROM subscriptions WHERE number = ?", (number,)).fetchone()
-        if not row:
-            raise ApiError(404, "Subscription not found")
-        plan = connection.execute("SELECT * FROM plans WHERE id = ?", (row["plan_id"],)).fetchone()
-        today = date.today()
-        if action == "pause":
-            if not plan["allow_pause"]:
-                raise ApiError(400, "Pausing is disabled for this plan")
-            if row["status"] != "ACTIVE":
-                raise ApiError(409, "Only active subscriptions can be paused")
-            connection.execute("UPDATE subscriptions SET status = 'PAUSED' WHERE id = ?", (row["id"],))
-        elif action == "resume":
-            if row["status"] != "PAUSED":
-                raise ApiError(409, "Only paused subscriptions can be resumed")
-            next_bill = row["next_billing_date"]
-            if next_bill < date_string(today):
-                next_bill = date_string(today)
-            connection.execute("UPDATE subscriptions SET status = 'ACTIVE', next_billing_date = ? WHERE id = ?", (next_bill, row["id"]))
-        elif action == "cancel":
-            if not plan["allow_cancellation"]:
-                raise ApiError(400, "Cancellation is disabled for this plan")
-            if row["status"] == "CLOSED":
-                raise ApiError(409, "Subscription is already closed")
-            connection.execute("UPDATE subscriptions SET status = 'CLOSED', end_date = ?, auto_renew = 0 WHERE id = ?", (date_string(today), row["id"]))
-        elif action == "renew":
-            if not plan["allow_renewal"]:
-                raise ApiError(400, "Renewal is disabled for this plan")
-            if row["status"] not in ("ACTIVE", "CLOSED"):
-                raise ApiError(409, "Only active or closed subscriptions can be renewed")
-            base = date.fromisoformat(row["end_date"]) if row["end_date"] and date.fromisoformat(row["end_date"]) >= today else today
-            new_end = add_period(base, plan["billing_interval"], plan["interval_count"])
-            next_bill = row["next_billing_date"] if row["next_billing_date"] >= date_string(today) else date_string(today)
-            connection.execute("UPDATE subscriptions SET status = 'ACTIVE', end_date = ?, next_billing_date = ?, auto_renew = 1 WHERE id = ?", (date_string(new_end), next_bill, row["id"]))
-        connection.commit()
-        updated = connection.execute("SELECT * FROM subscriptions WHERE id = ?", (row["id"],)).fetchone()
-        self.send_json(200, subscription_record(connection, updated))
-
-    def confirm_invoice(self, connection: sqlite3.Connection, number: str) -> None:
-        row = connection.execute("SELECT * FROM invoices WHERE number = ?", (number,)).fetchone()
-        if not row:
-            raise ApiError(404, "Invoice not found")
-        if row["status"] != "DRAFT":
-            raise ApiError(409, "Only draft invoices can be confirmed")
-        connection.execute("UPDATE invoices SET status = 'CONFIRMED' WHERE id = ?", (row["id"],))
-        connection.commit()
-        updated = connection.execute("SELECT * FROM invoices WHERE id = ?", (row["id"],)).fetchone()
-        self.send_json(200, invoice_record(connection, updated))
-
-    def run_billing(self, connection: sqlite3.Connection, data: dict) -> None:
-        run_date = date.fromisoformat(data.get("runDate", date_string()))
-        rows = connection.execute(
-            "SELECT * FROM subscriptions WHERE status = 'ACTIVE' AND next_billing_date <= ? ORDER BY id",
-            (date_string(run_date),),
-        ).fetchall()
-        created = []
-        for sub in rows:
-            plan = connection.execute("SELECT * FROM plans WHERE id = ?", (sub["plan_id"],)).fetchone()
-            period_start = sub["next_billing_date"]
-            subtotal = round(sub["unit_price"] * sub["quantity"], 2)
-            discount = round(subtotal * sub["discount_percent"] / 100, 2)
-            tax = round((subtotal - discount) * plan["tax_rate"] / 100, 2)
-            total = round(subtotal - discount + tax, 2)
-            number = self.next_number(connection, "invoices", "number", "INV-")
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO invoices(number, subscription_id, billing_period_start,
-                   issue_date, due_date, status, subtotal, discount_amount, tax_rate, tax_amount,
-                   total, amount_paid) VALUES (?, ?, ?, ?, ?, 'CONFIRMED', ?, ?, ?, ?, ?, 0)""",
-                (number, sub["id"], period_start, date_string(run_date), date_string(run_date + timedelta(days=7)), subtotal, discount, plan["tax_rate"], tax, total),
-            )
-            if cursor.rowcount:
-                created.append(invoice_record(connection, connection.execute("SELECT * FROM invoices WHERE id = ?", (cursor.lastrowid,)).fetchone()))
-                next_date = add_period(date.fromisoformat(period_start), plan["billing_interval"], plan["interval_count"])
-                connection.execute("UPDATE subscriptions SET next_billing_date = ? WHERE id = ?", (date_string(next_date), sub["id"]))
-        connection.commit()
-        self.send_json(200, {"createdCount": len(created), "invoices": created, "runDate": date_string(run_date)})
-
-    def create_payment(self, connection: sqlite3.Connection, data: dict) -> None:
-        invoice_number = self.required_text(data, "invoiceNumber")
-        invoice = connection.execute("SELECT * FROM invoices WHERE number = ?", (invoice_number,)).fetchone()
-        if not invoice:
-            raise ApiError(404, "Invoice not found")
-        if invoice["status"] not in ("CONFIRMED", "OVERDUE"):
-            raise ApiError(409, "Payments can only be recorded for confirmed invoices")
-        amount = self.number(data, "amount", minimum=0.01)
-        balance = round(invoice["total"] - invoice["amount_paid"], 2)
-        if amount > balance:
-            raise ApiError(400, f"Payment exceeds the remaining balance of {balance:.2f}")
-        method = str(data.get("method", "Manual")).strip() or "Manual"
-        paid_at = str(data.get("paidAt", date_string()))
-        cursor = connection.execute(
-            "INSERT INTO payments(invoice_id, amount, method, paid_at, note) VALUES (?, ?, ?, ?, ?)",
-            (invoice["id"], amount, method, paid_at, str(data.get("note", ""))),
-        )
-        new_paid = round(invoice["amount_paid"] + amount, 2)
-        new_status = "PAID" if new_paid >= invoice["total"] else "CONFIRMED"
-        connection.execute("UPDATE invoices SET amount_paid = ?, status = ? WHERE id = ?", (new_paid, new_status, invoice["id"]))
-        connection.commit()
-        payment = connection.execute("SELECT * FROM payments WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        updated_invoice = connection.execute("SELECT * FROM invoices WHERE id = ?", (invoice["id"],)).fetchone()
-        result = {
-            "id": payment["id"], "invoiceId": payment["invoice_id"], "invoiceNumber": invoice_number,
-            "amount": round(payment["amount"], 2), "method": payment["method"], "paidAt": payment["paid_at"],
-            "note": payment["note"], "currency": CURRENCY,
-            "invoice": invoice_record(connection, updated_invoice),
-        }
-        self.send_json(201, result)
-
-    def required_text(self, data: dict, key: str) -> str:
-        value = str(data.get(key, "")).strip()
-        if not value:
-            raise ApiError(400, f"{key} is required")
-        return value
-
-    def number(self, data: dict, key: str, minimum: float, maximum: float | None = None, default: float | None = None) -> float:
-        try:
-            value = float(data.get(key, default))
-        except (ValueError, TypeError):
-            raise ApiError(400, f"{key} must be a number") from None
-        if value < minimum or (maximum is not None and value > maximum):
-            suffix = f" and at most {maximum}" if maximum is not None else ""
-            raise ApiError(400, f"{key} must be at least {minimum}{suffix}")
-        return value
-
-    def next_number(self, connection: sqlite3.Connection, table: str, column: str, prefix: str) -> str:
-        rows = connection.execute(f"SELECT {column} FROM {table} WHERE {column} LIKE ?", (prefix + "%",)).fetchall()
-        maximum = 0
-        for row in rows:
-            digits = re.search(r"(\d+)$", row[column])
-            if digits:
-                maximum = max(maximum, int(digits.group(1)))
-        return f"{prefix}{maximum + 1:04d}"
+            body = body_json(self)
+            if path == "/api/v1/customers":
+                return self.send_json(201, create_customer(body))
+            if path == "/api/v1/products":
+                return self.send_json(201, create_product(body))
+            if path == "/api/v1/plans":
+                return self.send_json(201, create_plan(body))
+            if path == "/api/v1/subscriptions":
+                return self.send_json(201, create_subscription(body))
+            if path == "/api/v1/payments":
+                return self.send_json(201, register_payment(body))
+            match = re.fullmatch(r"/api/v1/subscriptions/([^/]+)/(pause|resume|cancel)", path)
+            if match:
+                return self.send_json(200, subscription_action(unquote(match.group(1)), match.group(2), body))
+            match = re.fullmatch(r"/api/v1/invoices/([^/]+)/(post|confirm)", path)
+            if match:
+                return self.send_json(200, post_invoice(unquote(match.group(1))))
+            return self.send_json(404, {"error": "Route not found."})
+        except ValueError as error:
+            return self.send_json(400, {"error": str(error)})
+        except OdooAPIError as error:
+            return self.send_json(error.status, {"error": error.message})
+        except Exception:
+            return self.send_json(500, {"error": "Unexpected backend error. Check local server logs."})
 
 
-def main() -> None:
-    initialize()
-    print(f"Brightloop Subscription API running at http://{HOST}:{PORT}")
-    print(f"Using local demo database: {DB_PATH}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+def main():
+    if HOST not in {"127.0.0.1", "localhost", "::1"} and not APP_API_TOKEN:
+        raise SystemExit("Set APP_API_TOKEN before exposing the API beyond this computer.")
+    if not ODOO.configured:
+        print("Odoo key not configured. /health works; data routes will return 503.")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Odoo-backed REST API listening at http://{HOST}:{PORT}")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
